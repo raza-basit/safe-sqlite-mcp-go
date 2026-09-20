@@ -26,3 +26,4 @@ jobs:
 
       - name: Build Binary
         run: CGO_ENABLED=0 go build -v -o safe-sqlite-mcp-go .
+

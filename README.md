@@ -1,8 +1,8 @@
 # safe-sqlite-mcp-go
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/razabasit/safe-sqlite-mcp-go.svg)](https://pkg.go.dev/github.com/razabasit/safe-sqlite-mcp-go)
+[![Go Reference](https://pkg.go.dev/badge/github.com/raza-basit/safe-sqlite-mcp-go.svg)](https://pkg.go.dev/github.com/raza-basit/safe-sqlite-mcp-go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![CI](https://github.com/razabasit/safe-sqlite-mcp-go/actions/workflows/ci.yml/badge.svg)](https://github.com/razabasit/safe-sqlite-mcp-go/actions)
+[![CI](https://github.com/raza-basit/safe-sqlite-mcp-go/actions/workflows/ci.yml/badge.svg)](https://github.com/raza-basit/safe-sqlite-mcp-go/actions)
 
 A high-performance, single-binary [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server in Go that exposes SQLite databases to AI agents with **immutable, connection-level safety guardrails**.
 
@@ -41,13 +41,13 @@ Giving an autonomous AI agent (Claude, Cursor, Copilot) raw shell or database ac
 Ensure `$GOPATH/bin` is in your system `$PATH`:
 
 ```bash
-go install github.com/razabasit/safe-sqlite-mcp-go@latest
+go install github.com/raza-basit/safe-sqlite-mcp-go@latest
 ```
 
 ### Option 2: Clone and Build from Source
 
 ```bash
-git clone https://github.com/razabasit/safe-sqlite-mcp-go.git
+git clone https://github.com/raza-basit/safe-sqlite-mcp-go.git
 cd safe-sqlite-mcp-go
 go build -o safe-sqlite-mcp-go .
 ```
@@ -118,3 +118,4 @@ Output:
 ## License
 
 MIT © [Raza Basit](https://raza.build)
+

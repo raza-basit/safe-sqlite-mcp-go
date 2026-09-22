@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/raza-basit/safe-sqlite-mcp-go/actions/workflows/ci.yml/badge.svg)](https://github.com/raza-basit/safe-sqlite-mcp-go/actions)
 
-A high-performance, single-binary [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server in Go that exposes SQLite databases to AI agents with **immutable, connection-level safety guardrails**.
+A high-performance, single-binary [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server in Go that exposes SQLite databases to AI agents with **immutable database guardrails and exfiltration defenses**.
 
 > 📖 **Read the full architectural breakdown**: [Building a Safe SQLite MCP Server in Go — Why Agents Shouldn't Have Raw Database Access](https://raza.build/blog/safe-sqlite-mcp-server-go) on [raza.build](https://raza.build).
 
@@ -12,12 +12,13 @@ A high-performance, single-binary [Model Context Protocol (MCP)](https://modelco
 
 ## The Problem
 
-Giving an autonomous AI agent (Claude, Cursor, Copilot) raw shell or database access is an operational liability:
-* **Accidental Mutations**: A hallucinated `UPDATE`, `DELETE`, or `DROP TABLE` can wipe out records in milliseconds.
-* **Context Window Overflows**: Running an unindexed `SELECT * FROM events` can pull hundreds of thousands of rows into the LLM context, exhausting token limits and racking up API costs.
+Giving an autonomous AI agent (Claude, Cursor, Copilot) raw database or shell access is an operational liability:
+* **Accidental Mutations**: Hallucinated `UPDATE`, `DELETE`, or `DROP TABLE` statements can destroy data in milliseconds.
+* **Context Window Overflows**: Running unindexed `SELECT *` queries pulls tens of thousands of rows into context, exhausting token limits and racking up API costs.
+* **Silent Exfiltration & Pagination Scraping**: Even in 100% read-only mode, an agent can dump sensitive columns (`password_hash`, `api_token`) or loop through an entire database 50 rows at a time (`LIMIT 50 OFFSET 0, 50, 100...`).
 * **Runaway Queries**: Heavy joins or full-table scans can peg host CPU without deadlines.
 
-`safe-sqlite-mcp-go` sits as a **secure boundary layer** between the LLM and your SQLite database.
+`safe-sqlite-mcp-go` sits as a **secure boundary layer** enforcing defense-in-depth between the LLM and your SQLite database.
 
 ---
 
@@ -26,7 +27,11 @@ Giving an autonomous AI agent (Claude, Cursor, Copilot) raw shell or database ac
 | Guardrail | Implementation Mechanism |
 | :--- | :--- |
 | **Connection Immutability** | Opened with `file:path?mode=ro` and `PRAGMA query_only = ON`. Any write attempt is rejected by the database engine itself. |
-| **Context Window Protection** | Results are capped at **50 rows** by default. Includes explicit truncation notices guiding the LLM to refine queries. |
+| **Context Window Protection** | Results are capped at **50 rows** per query by default, with truncation notices guiding the LLM to refine predicates. |
+| **Cumulative Session Row Budgets** | Enforces a sliding session-wide quota (default: 250 rows) to halt automated pagination harvesting (`OFFSET` scraping). |
+| **Sensitive Column Denylisting** | Rejects queries exposing forbidden columns (e.g. `password`, `password_hash`, `secret`, `api_key`, `token`, `ssn`, `credit_card`). |
+| **Table Allowlists** | Restricts table discovery (`list_tables`, `describe_table`) and execution strictly to an approved schema whitelist. |
+| **Query Shape Enforcement** | Optional `--disallow-wildcard` flag to reject `SELECT *` and force explicit column selection. |
 | **Strict Timeouts** | Every query is bound to a `context.WithTimeout(2*time.Second)`. |
 | **Zero Cgo** | Built with [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) for clean, pure-Go cross-compilation (`CGO_ENABLED=0`). |
 | **Minimal Footprint** | Compiles to a single static ~12MB binary. Sub-2ms startup time and <8MB RSS memory. |
@@ -54,6 +59,19 @@ go build -o safe-sqlite-mcp-go .
 
 ---
 
+## Configuration & Flags
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `--db` | *required* | Path to the SQLite database file |
+| `--max-rows` | `50` | Maximum rows returned per individual query |
+| `--max-session-rows` | `250` | Maximum cumulative rows across a session (0 to disable) |
+| `--deny-columns` | `password,password_hash,secret,api_key,token,ssn,credit_card` | Comma-separated list of forbidden column names |
+| `--allow-tables` | `""` | Comma-separated list of permitted tables (empty allows all non-system tables) |
+| `--disallow-wildcard` | `false` | Reject queries containing wildcard `SELECT *` |
+
+---
+
 ## Client Setup
 
 ### Claude Desktop
@@ -69,7 +87,11 @@ Add the server under `mcpServers`:
   "mcpServers": {
     "sqlite-db": {
       "command": "safe-sqlite-mcp-go",
-      "args": ["--db", "/absolute/path/to/your/database.db"]
+      "args": [
+        "--db", "/absolute/path/to/your/database.db",
+        "--max-session-rows", "250",
+        "--disallow-wildcard"
+      ]
     }
   }
 }
@@ -79,7 +101,7 @@ Add the server under `mcpServers`:
 
 Add a new MCP server in settings:
 * **Type**: `command`
-* **Command**: `safe-sqlite-mcp-go --db /absolute/path/to/your/database.db`
+* **Command**: `safe-sqlite-mcp-go --db /absolute/path/to/your/database.db --max-session-rows 250`
 
 ---
 
@@ -87,9 +109,9 @@ Add a new MCP server in settings:
 
 The server registers three tools during the `tools/list` capability handshake:
 
-1. `list_tables`: Enumerates user tables in the database catalog.
+1. `list_tables`: Enumerates approved user tables in the database catalog.
 2. `describe_table`: Fetches column names, data types, nullability, default values, and primary key indicators.
-3. `read_query`: Executes a safe `SELECT` query with timeout protection and automated row capping.
+3. `read_query`: Executes a safe `SELECT` query with timeout protection, automated row capping, and column safety checks.
 
 ---
 
@@ -106,6 +128,9 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_tab
 
 # 3. Test Mutation Rejection
 printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_query","arguments":{"query":"DROP TABLE users;"}}}\n' | safe-sqlite-mcp-go --db test.db
+
+# 4. Test Sensitive Column Rejection
+printf '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_query","arguments":{"query":"SELECT password_hash FROM users;"}}}\n' | safe-sqlite-mcp-go --db test.db
 ```
 
 Output:
@@ -118,4 +143,3 @@ Output:
 ## License
 
 MIT © [Raza Basit](https://raza.build)
-

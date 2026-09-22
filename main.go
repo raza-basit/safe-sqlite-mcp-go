@@ -3,18 +3,23 @@ package main
 import (
 	"bufio"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 )
 
 func main() {
 	dbPath := flag.String("db", "", "Path to the SQLite database file (required)")
+	maxRows := flag.Int("max-rows", 50, "Maximum rows returned per individual query")
+	maxSessionRows := flag.Int64("max-session-rows", 250, "Maximum cumulative rows returned in a session (0 to disable)")
+	denyCols := flag.String("deny-columns", "password,password_hash,secret,api_key,token,ssn,credit_card", "Comma-separated list of forbidden column names")
+	allowTables := flag.String("allow-tables", "", "Comma-separated list of permitted tables (empty allows all non-system tables)")
+	disallowWildcard := flag.Bool("disallow-wildcard", false, "Reject queries containing wildcard 'SELECT *'")
 	flag.Parse()
 
 	// CRITICAL: Ensure all application logging goes strictly to stderr.
@@ -31,6 +36,39 @@ func main() {
 		log.Fatalf("[FATAL] %v", err)
 	}
 	defer db.Close()
+
+	policy := NewDefaultPolicy()
+	policy.MaxRowsPerQuery = *maxRows
+	policy.MaxSessionRows = *maxSessionRows
+	policy.DisallowWildcard = *disallowWildcard
+
+	if *denyCols != "" {
+		policy.DenyColumns = make(map[string]bool)
+		for _, c := range strings.Split(*denyCols, ",") {
+			c = strings.ToLower(strings.TrimSpace(c))
+			if c != "" {
+				policy.DenyColumns[c] = true
+			}
+		}
+	}
+
+	if *allowTables != "" {
+		policy.AllowTables = make(map[string]bool)
+		for _, t := range strings.Split(*allowTables, ",") {
+			t = strings.ToLower(strings.TrimSpace(t))
+			if t != "" {
+				policy.AllowTables[t] = true
+			}
+		}
+	}
+
+	state := &ServerState{
+		DB:     db,
+		Policy: policy,
+	}
+
+	log.Printf("[INFO] Security policy active: max-rows=%d, max-session-rows=%d, disallow-wildcard=%v",
+		policy.MaxRowsPerQuery, policy.MaxSessionRows, policy.DisallowWildcard)
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -53,19 +91,19 @@ func main() {
 			continue
 		}
 
-		handleRequest(&req, db)
+		handleRequest(&req, state)
 	}
 }
 
 // handleRequest dispatches incoming JSON-RPC methods according to the MCP specification.
-func handleRequest(req *JSONRPCRequest, db *sql.DB) {
+func handleRequest(req *JSONRPCRequest, state *ServerState) {
 	switch req.Method {
 	case "initialize":
 		sendResponse(req.ID, map[string]any{
 			"protocolVersion": "2024-11-05",
 			"serverInfo": map[string]string{
 				"name":    "safe-sqlite-mcp-go",
-				"version": "1.0.0",
+				"version": "1.1.0",
 			},
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
@@ -96,21 +134,21 @@ func handleRequest(req *JSONRPCRequest, db *sql.DB) {
 
 		switch params.Name {
 		case "list_tables":
-			resultText, execErr = listTables(ctx, db)
+			resultText, execErr = listTables(ctx, state)
 
 		case "describe_table":
 			var args struct {
 				Table string `json:"table"`
 			}
 			_ = json.Unmarshal(params.Arguments, &args)
-			resultText, execErr = describeTable(ctx, db, args.Table)
+			resultText, execErr = describeTable(ctx, state, args.Table)
 
 		case "read_query":
 			var args struct {
 				Query string `json:"query"`
 			}
 			_ = json.Unmarshal(params.Arguments, &args)
-			resultText, execErr = readQuery(ctx, db, args.Query)
+			resultText, execErr = readQuery(ctx, state, args.Query)
 
 		default:
 			sendError(req.ID, -32601, fmt.Sprintf("Unknown tool: %s", params.Name))

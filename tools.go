@@ -6,10 +6,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
 
-// maxResultRows caps the query output to prevent overflowing LLM context windows.
-const maxResultRows = 50
+// SecurityPolicy defines guardrails for mitigating data exfiltration, runaway queries, and query drift.
+type SecurityPolicy struct {
+	MaxRowsPerQuery  int             // Max rows per single query (default 50)
+	MaxSessionRows   int64           // Max cumulative rows across the entire session (0 = disabled)
+	DenyColumns      map[string]bool // Forbidden column names (case-insensitive)
+	AllowTables      map[string]bool // If non-empty, only these tables can be accessed
+	DisallowWildcard bool            // If true, reject 'SELECT *' queries
+}
+
+// ServerState encapsulates the database connection, security policy, and session accounting.
+type ServerState struct {
+	DB             *sql.DB
+	Policy         SecurityPolicy
+	CumulativeRows atomic.Int64
+}
+
+// NewDefaultPolicy creates a standard production security policy.
+func NewDefaultPolicy() SecurityPolicy {
+	deny := []string{"password", "password_hash", "secret", "api_key", "token", "ssn", "credit_card"}
+	denyMap := make(map[string]bool)
+	for _, c := range deny {
+		denyMap[strings.ToLower(strings.TrimSpace(c))] = true
+	}
+	return SecurityPolicy{
+		MaxRowsPerQuery:  50,
+		MaxSessionRows:   250,
+		DenyColumns:      denyMap,
+		AllowTables:      make(map[string]bool),
+		DisallowWildcard: false,
+	}
+}
 
 // toolsList defines the tools registered with the MCP client.
 var toolsList = []Tool{
@@ -37,7 +67,7 @@ var toolsList = []Tool{
 	},
 	{
 		Name:        "read_query",
-		Description: "Execute a read-only SQL SELECT query against the SQLite database. Any write attempt will be rejected.",
+		Description: "Execute a read-only SQL SELECT query against the SQLite database. Writes, sensitive columns, and queries exceeding session row quotas are rejected.",
 		InputSchema: InputSchema{
 			Type: "object",
 			Properties: map[string]PropertyDef{
@@ -52,14 +82,14 @@ var toolsList = []Tool{
 }
 
 // listTables queries the sqlite_master catalog for all non-system tables.
-func listTables(ctx context.Context, db *sql.DB) (string, error) {
+func listTables(ctx context.Context, state *ServerState) (string, error) {
 	query := `
 		SELECT name 
 		FROM sqlite_master 
 		WHERE type='table' AND name NOT LIKE 'sqlite_%'
 		ORDER BY name ASC;
 	`
-	rows, err := db.QueryContext(ctx, query)
+	rows, err := state.DB.QueryContext(ctx, query)
 	if err != nil {
 		return "", err
 	}
@@ -71,18 +101,21 @@ func listTables(ctx context.Context, db *sql.DB) (string, error) {
 		if err := rows.Scan(&name); err != nil {
 			return "", err
 		}
+		if len(state.Policy.AllowTables) > 0 && !state.Policy.AllowTables[strings.ToLower(name)] {
+			continue
+		}
 		tables = append(tables, name)
 	}
 
 	if len(tables) == 0 {
-		return "Database contains no user tables.", nil
+		return "Database contains no accessible user tables.", nil
 	}
 
 	return strings.Join(tables, "\n"), nil
 }
 
 // describeTable retrieves column-level metadata using PRAGMA table_info.
-func describeTable(ctx context.Context, db *sql.DB, tableName string) (string, error) {
+func describeTable(ctx context.Context, state *ServerState, tableName string) (string, error) {
 	// Strict identifier sanitization
 	for _, ch := range tableName {
 		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
@@ -90,7 +123,11 @@ func describeTable(ctx context.Context, db *sql.DB, tableName string) (string, e
 		}
 	}
 
-	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", tableName))
+	if len(state.Policy.AllowTables) > 0 && !state.Policy.AllowTables[strings.ToLower(tableName)] {
+		return "", fmt.Errorf("table %q is not in the allowed schema policy", tableName)
+	}
+
+	rows, err := state.DB.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", tableName))
 	if err != nil {
 		return "", err
 	}
@@ -122,9 +159,34 @@ func describeTable(ctx context.Context, db *sql.DB, tableName string) (string, e
 	return builder.String(), nil
 }
 
-// readQuery executes an arbitrary read-only query and formats the output as JSON, capped at maxResultRows.
-func readQuery(ctx context.Context, db *sql.DB, query string) (string, error) {
-	rows, err := db.QueryContext(ctx, query)
+// readQuery executes an arbitrary read-only query and formats the output as JSON, capped by policy limits.
+func readQuery(ctx context.Context, state *ServerState, query string) (string, error) {
+	trimmed := strings.TrimSpace(query)
+	upperQuery := strings.ToUpper(trimmed)
+
+	// 1. Wildcard query shape check
+	if state.Policy.DisallowWildcard {
+		if strings.Contains(upperQuery, "SELECT *") || strings.Contains(upperQuery, "SELECT\n*") || strings.Contains(upperQuery, "SELECT\t*") {
+			return "", fmt.Errorf("wildcard 'SELECT *' is rejected by security policy; explicit column projections required")
+		}
+	}
+
+	// 2. Cumulative session row budget check
+	if state.Policy.MaxSessionRows > 0 {
+		current := state.CumulativeRows.Load()
+		if current >= state.Policy.MaxSessionRows {
+			return "", fmt.Errorf("session row budget exceeded (%d/%d cumulative rows fetched); re-authorization required to prevent automated exfiltration", current, state.Policy.MaxSessionRows)
+		}
+	}
+
+	// 3. System catalog snooping prevention if table allowlist is active
+	if len(state.Policy.AllowTables) > 0 {
+		if strings.Contains(upperQuery, "SQLITE_MASTER") || strings.Contains(upperQuery, "SQLITE_SCHEMA") {
+			return "", fmt.Errorf("direct catalog inspection is blocked by security policy; use list_tables instead")
+		}
+	}
+
+	rows, err := state.DB.QueryContext(ctx, query)
 	if err != nil {
 		return "", fmt.Errorf("query execution failed: %w", err)
 	}
@@ -135,12 +197,24 @@ func readQuery(ctx context.Context, db *sql.DB, query string) (string, error) {
 		return "", err
 	}
 
+	// 4. Sensitive Column Denylist Check (Column Shape Validation)
+	for _, col := range cols {
+		colLower := strings.ToLower(strings.TrimSpace(col))
+		if state.Policy.DenyColumns[colLower] {
+			return "", fmt.Errorf("access to sensitive column %q is blocked by security policy", col)
+		}
+	}
+
 	var results []map[string]any
 	count := 0
 	truncated := false
+	maxRows := state.Policy.MaxRowsPerQuery
+	if maxRows <= 0 {
+		maxRows = 50
+	}
 
 	for rows.Next() {
-		if count >= maxResultRows {
+		if count >= maxRows {
 			truncated = true
 			break
 		}
@@ -168,6 +242,9 @@ func readQuery(ctx context.Context, db *sql.DB, query string) (string, error) {
 		count++
 	}
 
+	// Record session accounting
+	newTotal := state.CumulativeRows.Add(int64(count))
+
 	jsonBytes, err := json.MarshalIndent(results, "", "  ")
 	if err != nil {
 		return "", err
@@ -175,7 +252,10 @@ func readQuery(ctx context.Context, db *sql.DB, query string) (string, error) {
 
 	output := string(jsonBytes)
 	if truncated {
-		output += fmt.Sprintf("\n\n[NOTICE: Output truncated at %d rows to protect context limits. Add a specific WHERE clause or LIMIT to refine.]", maxResultRows)
+		output += fmt.Sprintf("\n\n[NOTICE: Output truncated at %d rows to protect context limits. Add a specific WHERE clause or LIMIT to refine.]", maxRows)
+	}
+	if state.Policy.MaxSessionRows > 0 {
+		output += fmt.Sprintf("\n[SESSION BUDGET: %d/%d cumulative rows fetched]", newTotal, state.Policy.MaxSessionRows)
 	}
 
 	return output, nil

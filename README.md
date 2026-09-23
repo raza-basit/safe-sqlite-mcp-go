@@ -26,13 +26,13 @@ Giving an autonomous AI agent (Claude, Cursor, Copilot) raw database or shell ac
 
 | Guardrail | Implementation Mechanism |
 | :--- | :--- |
-| **Connection Immutability** | Opened with `file:path?mode=ro` and `PRAGMA query_only = ON`. Any write attempt is rejected by the database engine itself. |
+| **Connection Immutability** | Opened with `file:path?mode=ro`, driver-level connection hooks, and `PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;`. |
 | **Context Window Protection** | Results are capped at **50 rows** per query by default, with truncation notices guiding the LLM to refine predicates. |
-| **Cumulative Session Row Budgets** | Enforces a sliding session-wide quota (default: 250 rows) to halt automated pagination harvesting (`OFFSET` scraping). |
-| **Sensitive Column Denylisting** | Rejects queries exposing forbidden columns (e.g. `password`, `password_hash`, `secret`, `api_key`, `token`, `ssn`, `credit_card`). |
-| **Table Allowlists** | Restricts table discovery (`list_tables`, `describe_table`) and execution strictly to an approved schema whitelist. |
-| **Query Shape Enforcement** | Optional `--disallow-wildcard` flag to reject `SELECT *` and force explicit column selection. |
-| **Strict Timeouts** | Every query is bound to a `context.WithTimeout(2*time.Second)`. |
+| **Cumulative Session Row Budgets** | Enforces a strict sliding session-wide quota (default: 250 rows) clamped so cumulative rows never breach the limit. |
+| **Sensitive Column Denylisting** | Pure-Go lexical analyzer rejects queries referencing forbidden columns anywhere (projections, aliases, expressions, WHERE, ORDER BY). |
+| **Table Allowlists** | Restricts table discovery (`list_tables`, `describe_table`) and query execution (`read_query`) strictly to approved tables. |
+| **Query Shape Enforcement** | Optional `--disallow-wildcard` flag to reject wildcard `SELECT *` and `u.*` while permitting arithmetic multiplication (`a * b`). |
+| **Configurable Timeouts** | Bound to `context.WithTimeout` (default 2s, configurable via `--query-timeout`). |
 | **Zero Cgo** | Built with [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) for clean, pure-Go cross-compilation (`CGO_ENABLED=0`). |
 | **Minimal Footprint** | Compiles to a single static ~12MB binary. Sub-2ms startup time and <8MB RSS memory. |
 | **Clean Stdio Framing** | Debug and error logs are isolated strictly to `os.Stderr`, guaranteeing zero JSON-RPC framing corruption on `os.Stdout`. |
@@ -69,6 +69,7 @@ go build -o safe-sqlite-mcp-go .
 | `--deny-columns` | `password,password_hash,secret,api_key,token,ssn,credit_card` | Comma-separated list of forbidden column names |
 | `--allow-tables` | `""` | Comma-separated list of permitted tables (empty allows all non-system tables) |
 | `--disallow-wildcard` | `false` | Reject queries containing wildcard `SELECT *` |
+| `--query-timeout` | `2s` | Maximum execution time per database query |
 
 ---
 

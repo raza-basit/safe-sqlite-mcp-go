@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -20,6 +21,7 @@ func main() {
 	denyCols := flag.String("deny-columns", "password,password_hash,secret,api_key,token,ssn,credit_card", "Comma-separated list of forbidden column names")
 	allowTables := flag.String("allow-tables", "", "Comma-separated list of permitted tables (empty allows all non-system tables)")
 	disallowWildcard := flag.Bool("disallow-wildcard", false, "Reject queries containing wildcard 'SELECT *'")
+	queryTimeout := flag.Duration("query-timeout", 2*time.Second, "Maximum execution time per database query")
 	flag.Parse()
 
 	// CRITICAL: Ensure all application logging goes strictly to stderr.
@@ -63,12 +65,13 @@ func main() {
 	}
 
 	state := &ServerState{
-		DB:     db,
-		Policy: policy,
+		DB:      db,
+		Policy:  policy,
+		Timeout: *queryTimeout,
 	}
 
-	log.Printf("[INFO] Security policy active: max-rows=%d, max-session-rows=%d, disallow-wildcard=%v",
-		policy.MaxRowsPerQuery, policy.MaxSessionRows, policy.DisallowWildcard)
+	log.Printf("[INFO] Security policy active: max-rows=%d, max-session-rows=%d, disallow-wildcard=%v, query-timeout=%v",
+		policy.MaxRowsPerQuery, policy.MaxSessionRows, policy.DisallowWildcard, state.Timeout)
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -81,12 +84,13 @@ func main() {
 			continue
 		}
 
-		if len(line) == 0 || line[0] == '\n' {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
 			continue
 		}
 
 		var req JSONRPCRequest
-		if err := json.Unmarshal(line, &req); err != nil {
+		if err := json.Unmarshal(trimmed, &req); err != nil {
 			log.Printf("[ERROR] json parse error: %v", err)
 			continue
 		}
@@ -103,7 +107,7 @@ func handleRequest(req *JSONRPCRequest, state *ServerState) {
 			"protocolVersion": "2024-11-05",
 			"serverInfo": map[string]string{
 				"name":    "safe-sqlite-mcp-go",
-				"version": "1.1.0",
+				"version": "1.2.0",
 			},
 			"capabilities": map[string]any{
 				"tools": map[string]any{},
@@ -112,6 +116,9 @@ func handleRequest(req *JSONRPCRequest, state *ServerState) {
 
 	case "notifications/initialized":
 		// Client acknowledgment notification - no response required
+
+	case "ping":
+		sendResponse(req.ID, map[string]any{})
 
 	case "tools/list":
 		sendResponse(req.ID, map[string]any{
@@ -125,8 +132,11 @@ func handleRequest(req *JSONRPCRequest, state *ServerState) {
 			return
 		}
 
-		// Enforce a strict 2-second timeout on all database operations
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		timeout := state.Timeout
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
 		var resultText string
@@ -140,14 +150,52 @@ func handleRequest(req *JSONRPCRequest, state *ServerState) {
 			var args struct {
 				Table string `json:"table"`
 			}
-			_ = json.Unmarshal(params.Arguments, &args)
+			if len(params.Arguments) > 0 {
+				if err := json.Unmarshal(params.Arguments, &args); err != nil {
+					sendResponse(req.ID, ToolResult{
+						IsError: true,
+						Content: []ContentBlock{
+							{Type: "text", Text: fmt.Sprintf("invalid arguments for describe_table: %v", err)},
+						},
+					})
+					return
+				}
+			}
+			if strings.TrimSpace(args.Table) == "" {
+				sendResponse(req.ID, ToolResult{
+					IsError: true,
+					Content: []ContentBlock{
+						{Type: "text", Text: "missing required argument 'table'"},
+					},
+				})
+				return
+			}
 			resultText, execErr = describeTable(ctx, state, args.Table)
 
 		case "read_query":
 			var args struct {
 				Query string `json:"query"`
 			}
-			_ = json.Unmarshal(params.Arguments, &args)
+			if len(params.Arguments) > 0 {
+				if err := json.Unmarshal(params.Arguments, &args); err != nil {
+					sendResponse(req.ID, ToolResult{
+						IsError: true,
+						Content: []ContentBlock{
+							{Type: "text", Text: fmt.Sprintf("invalid arguments for read_query: %v", err)},
+						},
+					})
+					return
+				}
+			}
+			if strings.TrimSpace(args.Query) == "" {
+				sendResponse(req.ID, ToolResult{
+					IsError: true,
+					Content: []ContentBlock{
+						{Type: "text", Text: "missing required argument 'query'"},
+					},
+				})
+				return
+			}
 			resultText, execErr = readQuery(ctx, state, args.Query)
 
 		default:
@@ -172,7 +220,7 @@ func handleRequest(req *JSONRPCRequest, state *ServerState) {
 		})
 
 	default:
-		if len(req.ID) > 0 {
+		if len(req.ID) > 0 && string(req.ID) != "null" {
 			sendError(req.ID, -32601, fmt.Sprintf("Method not found: %s", req.Method))
 		}
 	}

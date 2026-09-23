@@ -67,6 +67,9 @@ type ContentBlock struct {
 
 // sendResponse writes a JSON-RPC 2.0 success response to stdout.
 func sendResponse(id json.RawMessage, result any) {
+	if len(id) == 0 || string(id) == "null" {
+		return
+	}
 	resp := JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      id,
@@ -78,6 +81,9 @@ func sendResponse(id json.RawMessage, result any) {
 
 // sendError writes a JSON-RPC 2.0 error response to stdout.
 func sendError(id json.RawMessage, code int, msg string) {
+	if len(id) == 0 || string(id) == "null" {
+		return
+	}
 	resp := JSONRPCResponse{
 		JSONRPC: "2.0",
 		ID:      id,
